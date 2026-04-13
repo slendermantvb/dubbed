@@ -4,18 +4,16 @@ import time
 
 app = Flask(__name__)
 
-# peers: { (ip, port): last_seen }
 PEERS = {}
+TIMEOUT = 60  # segundos
 
-TIMEOUT = 60  # segundos (vida del nodo)
-
-# ----------- LIMPIAR NODOS MUERTOS -----------
-def limpiar_peers():
+# ----------- LIMPIAR PEERS -----------
+def limpiar():
     ahora = time.time()
     muertos = []
 
-    for peer, last_seen in PEERS.items():
-        if ahora - last_seen > TIMEOUT:
+    for peer, t in PEERS.items():
+        if ahora - t > TIMEOUT:
             muertos.append(peer)
 
     for m in muertos:
@@ -33,11 +31,9 @@ def join():
         return {"error": "faltan datos"}, 400
 
     peer = (ip, int(port))
-
-    # actualizar timestamp
     PEERS[peer] = time.time()
 
-    limpiar_peers()
+    limpiar()
 
     return jsonify({
         "peers": list(PEERS.keys())
@@ -56,12 +52,12 @@ def heartbeat():
     if peer in PEERS:
         PEERS[peer] = time.time()
 
-    return {"status": "ok"}
+    return {"ok": True}
 
 # ----------- VER PEERS -----------
 @app.route("/peers")
 def peers():
-    limpiar_peers()
+    limpiar()
     return jsonify(list(PEERS.keys()))
 
 # ----------- HOME -----------
