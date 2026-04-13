@@ -3,86 +3,47 @@ import time
 
 app = Flask(__name__)
 
+# Almacén de datos
 PEERS = {}  # (ip, port) -> last_seen
-TIMEOUT = 60
-
-# -------- VALIDACIÓN --------
-
-def validar_ip(ip):
-    try:
-        parts = ip.split(".")
-        return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
-    except:
-        return False
-
-def validar_port(port):
-    return isinstance(port, int) and 0 < port < 65536
-
-# -------- LIMPIEZA --------
-
-def limpiar():
-    ahora = time.time()
-    muertos = []
-
-    for peer, t in PEERS.items():
-        if ahora - t > TIMEOUT:
-            muertos.append(peer)
-
-    for m in muertos:
-        del PEERS[m]
-
-# -------- JOIN --------
+MESSAGES = [] # Lista de diccionarios {id, user, msg, time}
+MAX_MESSAGES = 50
 
 @app.route("/join", methods=["POST"])
 def join():
-    try:
-        data = request.json
-        ip = data.get("ip")
-        port = data.get("port")
+    data = request.json
+    # Registramos al par. Usamos su IP pública detectada por Render
+    peer_ip = request.remote_addr
+    peer_port = data.get("port")
+    PEERS[f"{peer_ip}:{peer_port}"] = time.time()
+    
+    # Limpiar nodos inactivos (> 60s)
+    ahora = time.time()
+    for p in list(PEERS.keys()):
+        if ahora - PEERS[p] > 60:
+            del PEERS[p]
+            
+    return jsonify({"status": "ok", "count": len(PEERS)})
 
-        if not validar_ip(ip) or not validar_port(port):
-            return {"error": "datos inválidos"}, 400
+@app.route("/send", methods=["POST"])
+def send():
+    data = request.json
+    if not data or "id" not in data:
+        return {"err": "invalid"}, 400
+    
+    # Evitar duplicados en el servidor
+    if not any(m["id"] == data["id"] for m in MESSAGES):
+        MESSAGES.append(data)
+        if len(MESSAGES) > MAX_MESSAGES:
+            MESSAGES.pop(0)
+    return {"status": "sent"}
 
-        peer = (ip, int(port))
-        PEERS[peer] = time.time()
-
-        limpiar()
-
-        return jsonify({
-            "peers": list(PEERS.keys())
-        })
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-# -------- HEARTBEAT --------
-
-@app.route("/heartbeat", methods=["POST"])
-def heartbeat():
-    try:
-        data = request.json
-        ip = data.get("ip")
-        port = data.get("port")
-
-        peer = (ip, int(port))
-
-        if peer in PEERS:
-            PEERS[peer] = time.time()
-
-        return {"ok": True}
-
-    except:
-        return {"error": "fail"}, 500
-
-# -------- GET PEERS --------
-
-@app.route("/peers")
-def peers():
-    limpiar()
-    return jsonify(list(PEERS.keys()))
-
-# -------- HOME --------
+@app.route("/get")
+def get_messages():
+    return jsonify({"messages": MESSAGES})
 
 @app.route("/")
-def home():
-    return f"🟢 Bootstrap activo | peers: {len(PEERS)}"
+def index():
+    return f"Relay HTTP Activo. Nodos: {len(PEERS)} | Mensajes: {len(MESSAGES)}"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
