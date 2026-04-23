@@ -1,50 +1,40 @@
+import os
 from flask import Flask, request, jsonify
-import time
 
 app = Flask(__name__)
 
-PEERS = {}  # "ip:port" -> last_seen
-MESSAGES = []
-MAX_MESSAGES = 50
+# Memoria volátil para el tráfico en tránsito (se limpia sola)
+TRAFFIC_STACK = []
+MAX_CAPACITY = 100
 
-@app.route("/join", methods=["POST"])
-def join():
-    data = request.json
-    # Registramos al par usando su IP pública
-    peer_ip = request.remote_addr
-    peer_port = data.get("port")
-    PEERS[f"{peer_ip}:{peer_port}"] = time.time()
+@app.route("/push", methods=["POST"])
+def push_traffic():
+    """Recibe CUALQUIER cosa y la pone en el stack de transporte"""
+    data = request.get_json()
+    if not data:
+        return {"status": "empty"}, 400
+
+    # Metadatos mínimos de transporte
+    packet = {
+        "origin": request.remote_addr,
+        "content": data, # Aquí va el 'lo que sea'
+        "route": data.get("route", "general") # Opcional para filtrar apps
+    }
     
-    # Limpieza de nodos caídos (> 60s)
-    ahora = time.time()
-    for p in list(PEERS.keys()):
-        if ahora - PEERS[p] > 60:
-            del PEERS[p]
-            
-    # Devolvemos la lista de todos los pares conocidos para que el cliente los guarde
-    return jsonify({
-        "status": "ok", 
-        "peers": list(PEERS.keys()),
-        "count": len(PEERS)
-    })
-
-@app.route("/send", methods=["POST"])
-def send():
-    data = request.json
-    if not data or "id" not in data: return {"err": "invalid"}, 400
+    TRAFFIC_STACK.append(packet)
     
-    if not any(m["id"] == data["id"] for m in MESSAGES):
-        MESSAGES.append(data)
-        if len(MESSAGES) > MAX_MESSAGES: MESSAGES.pop(0)
-    return {"status": "sent"}
+    # Mantener el stack ligero
+    if len(TRAFFIC_STACK) > MAX_CAPACITY:
+        TRAFFIC_STACK.pop(0)
+        
+    return {"status": "relayed"}
 
-@app.route("/get")
-def get_messages():
-    return jsonify({"messages": MESSAGES})
-
-@app.route("/")
-def index():
-    return f"🟢 Relay Activo | Nodos: {len(PEERS)} | Buffer: {len(MESSAGES)}"
+@app.route("/pull/<route>")
+def pull_traffic(route):
+    """Las apps piden el tráfico filtrado por su ruta"""
+    # Filtramos el tráfico que pertenezca a esa app (chat, juego, etc)
+    relevant_traffic = [p for p in TRAFFIC_STACK if p["route"] == route]
+    return jsonify({"data": relevant_traffic})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
