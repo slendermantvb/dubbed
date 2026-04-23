@@ -1,40 +1,56 @@
 import os
+import zlib
+import base64
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Memoria volátil para el tráfico en tránsito (se limpia sola)
+# --- CONFIGURACIÓN DE ALTO RENDIMIENTO ---
+# 50,000 bloques comprimidos pueden representar millones de eventos de juego/chat
 TRAFFIC_STACK = []
-MAX_CAPACITY = 100
+MAX_BLOCKS = 50000 
+
+@app.route("/")
+def index():
+    return {
+        "engine": "Singularidad-Relay",
+        "status": "online",
+        "memory_usage": f"{(len(TRAFFIC_STACK) / MAX_BLOCKS) * 100:.2f}%"
+    }, 200
 
 @app.route("/push", methods=["POST"])
-def push_traffic():
-    """Recibe CUALQUIER cosa y la pone en el stack de transporte"""
-    data = request.get_json()
-    if not data:
-        return {"status": "empty"}, 400
-
-    # Metadatos mínimos de transporte
-    packet = {
-        "origin": request.remote_addr,
-        "content": data, # Aquí va el 'lo que sea'
-        "route": data.get("route", "general") # Opcional para filtrar apps
-    }
+def push():
+    """Recibe datos y los 'aplasta' instantáneamente"""
+    raw_data = request.get_data()
+    if not raw_data: return "0", 400
     
-    TRAFFIC_STACK.append(packet)
-    
-    # Mantener el stack ligero
-    if len(TRAFFIC_STACK) > MAX_CAPACITY:
-        TRAFFIC_STACK.pop(0)
+    try:
+        # Extraer ruta desde los headers para no parsear el cuerpo (Gana velocidad)
+        route = request.headers.get("route", "general")
         
-    return {"status": "relayed"}
+        # Compresión Máxima Nivel 9
+        compressed = zlib.compress(raw_data, 9)
+        c = base64.b64encode(compressed).decode('utf-8')
+        
+        # Inserción rápida en el stack
+        TRAFFIC_STACK.append({"r": route, "c": c})
+        
+        # Limpieza por bloques para mantener fluidez de CPU
+        if len(TRAFFIC_STACK) > MAX_BLOCKS:
+            TRAFFIC_STACK.pop(0)
+            
+        return "1", 200 # Respuesta de 1 byte para ahorrar ancho de banda
+    except:
+        return "error", 500
 
 @app.route("/pull/<route>")
-def pull_traffic(route):
-    """Las apps piden el tráfico filtrado por su ruta"""
-    # Filtramos el tráfico que pertenezca a esa app (chat, juego, etc)
-    relevant_traffic = [p for p in TRAFFIC_STACK if p["route"] == route]
-    return jsonify({"data": relevant_traffic})
+def pull(route):
+    """Entrega los últimos 50 paquetes comprimidos de una ruta específica"""
+    # Usamos reversed para que el cliente reciba lo más nuevo primero (Fluidez)
+    relevant = [p["c"] for p in reversed(TRAFFIC_STACK) if p["r"] == route][:50]
+    return jsonify(relevant), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Configuración optimizada para Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
