@@ -12,40 +12,39 @@ from flask import Flask, request, jsonify, g
 app = Flask(__name__)
 
 # ============================================================
-# SINGULARIDAD RELAY V4 PRO
+# SINGULARIDAD RELAY V5 P2P BOOTSTRAP
 # Zero-Persistence / Pure Transport / In-Memory Relay
 # ============================================================
 
-# ---------------- CONFIG ----------------
-
-ENGINE_NAME = "Singularidad-Relay-V4-PRO"
+ENGINE_NAME = "Singularidad-Relay-V5-P2P"
 
 ACCESS_TOKEN = os.environ.get("RELAY_KEY", "CAMBIA_ESTA_KEY_EN_ENV")
-
 PORT = int(os.environ.get("PORT", 10000))
 
 MAX_PACKETS_PER_ROUTE = int(os.environ.get("MAX_PACKETS_PER_ROUTE", 500))
-MAX_PAYLOAD_BYTES = int(os.environ.get("MAX_PAYLOAD_BYTES", 512 * 1024))  # 512 KB
-PACKET_TTL_SECONDS = int(os.environ.get("PACKET_TTL_SECONDS", 300))       # 5 minutos
+MAX_PAYLOAD_BYTES = int(os.environ.get("MAX_PAYLOAD_BYTES", 512 * 1024))
+PACKET_TTL_SECONDS = int(os.environ.get("PACKET_TTL_SECONDS", 300))
 MAX_PULL_PACKETS = int(os.environ.get("MAX_PULL_PACKETS", 200))
-
 COMPRESSION_LEVEL = int(os.environ.get("COMPRESSION_LEVEL", 5))
 
-ROUTE_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,80}$")
-
-# Rate limit simple por IP
-RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", 10))      # segundos
-RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 120)) # requests por ventana
-
-# Limpieza automática
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", 10))
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 120))
 CLEANER_INTERVAL = int(os.environ.get("CLEANER_INTERVAL", 30))
+
+NODE_TTL_SECONDS = int(os.environ.get("NODE_TTL_SECONDS", 90))
+
+ROUTE_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,80}$")
 
 # ---------------- MEMORIA ----------------
 
 TRAFFIC_BUS = defaultdict(lambda: deque(maxlen=MAX_PACKETS_PER_ROUTE))
 ROUTE_LOCKS = defaultdict(threading.RLock)
-
 RATE_BUCKETS = defaultdict(deque)
+
+NODES = {}
+NODES_LOCK = threading.RLock()
+
+GLOBAL_LOCK = threading.RLock()
 
 STATS = {
     "started_at": time.time(),
@@ -58,10 +57,10 @@ STATS = {
     "expired_total": 0,
     "rate_limited_total": 0,
     "errors_total": 0,
+    "registered_nodes_total": 0,
+    "relay_send_total": 0,
+    "broadcast_total": 0,
 }
-
-GLOBAL_LOCK = threading.RLock()
-
 
 # ============================================================
 # UTILIDADES
@@ -74,6 +73,7 @@ def now():
 def json_ok(data=None, status=200):
     if data is None:
         data = {}
+
     return jsonify({
         "ok": True,
         **data
@@ -92,7 +92,10 @@ def json_error(message, status=400, code="error"):
 
 
 def constant_time_token_check(token_a, token_b):
-    return hmac.compare_digest(token_a.encode("utf-8"), token_b.encode("utf-8"))
+    return hmac.compare_digest(
+        str(token_a).encode("utf-8"),
+        str(token_b).encode("utf-8")
+    )
 
 
 def is_authorized():
@@ -114,7 +117,7 @@ def get_client_ip():
 
 
 def is_valid_route(route):
-    return bool(ROUTE_PATTERN.match(route))
+    return bool(ROUTE_PATTERN.match(str(route)))
 
 
 def packet_id(route, payload, timestamp):
@@ -122,10 +125,73 @@ def packet_id(route, payload, timestamp):
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def rate_limited():
+    ip = get_client_ip()
+    current = now()
+
+    bucket = RATE_BUCKETS[ip]
+
+    while bucket and current - bucket[0] > RATE_LIMIT_WINDOW:
+        bucket.popleft()
+
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
+        with GLOBAL_LOCK:
+            STATS["rate_limited_total"] += 1
+        return True
+
+    bucket.append(current)
+    return False
+
+
+def require_auth_and_limits(route=None):
+    if rate_limited():
+        return json_error("Too many requests", status=429, code="rate_limited")
+
+    if not is_authorized():
+        return json_error("Unauthorized", status=401, code="unauthorized")
+
+    if route is not None and not is_valid_route(route):
+        return json_error(
+            "Invalid route. Use only letters, numbers, _, -, . and max 80 chars.",
+            status=400,
+            code="invalid_route"
+        )
+
+    return None
+
+
+def make_packet(route, raw_payload):
+    timestamp = now()
+    compressed = zlib.compress(raw_payload, COMPRESSION_LEVEL)
+    encoded = base64.b64encode(compressed).decode("ascii")
+
+    return {
+        "id": packet_id(route, raw_payload, timestamp),
+        "d": encoded,
+        "t": timestamp,
+        "raw": len(raw_payload),
+        "zip": len(compressed)
+    }
+
+
+def push_packet_to_route(route, raw_payload):
+    pkt = make_packet(route, raw_payload)
+
+    lock = ROUTE_LOCKS[route]
+
+    with lock:
+        cleanup_route(route)
+        TRAFFIC_BUS[route].append(pkt)
+        queue_size = len(TRAFFIC_BUS[route])
+
+    with GLOBAL_LOCK:
+        STATS["push_total"] += 1
+        STATS["bytes_in_total"] += len(raw_payload)
+
+    return pkt, queue_size
+
+
 def cleanup_route(route):
-    """
-    Borra paquetes vencidos de una ruta.
-    """
     current = now()
     removed = 0
 
@@ -170,50 +236,32 @@ def cleanup_all_routes():
     return total
 
 
-def rate_limited():
-    ip = get_client_ip()
+def cleanup_nodes():
     current = now()
+    removed = []
 
-    bucket = RATE_BUCKETS[ip]
+    with NODES_LOCK:
+        for node_id in list(NODES.keys()):
+            if current - NODES[node_id]["last_seen"] > NODE_TTL_SECONDS:
+                removed.append(node_id)
+                NODES.pop(node_id, None)
 
-    while bucket and current - bucket[0] > RATE_LIMIT_WINDOW:
-        bucket.popleft()
-
-    if len(bucket) >= RATE_LIMIT_REQUESTS:
-        with GLOBAL_LOCK:
-            STATS["rate_limited_total"] += 1
-        return True
-
-    bucket.append(current)
-    return False
+    return removed
 
 
-def require_auth_and_limits(route=None):
-    """
-    Validación común para rutas protegidas.
-    """
-    if rate_limited():
-        return json_error(
-            "Too many requests",
-            status=429,
-            code="rate_limited"
-        )
+def safe_int(value, default, min_value=None, max_value=None):
+    try:
+        num = int(value)
+    except Exception:
+        num = default
 
-    if not is_authorized():
-        return json_error(
-            "Unauthorized",
-            status=401,
-            code="unauthorized"
-        )
+    if min_value is not None:
+        num = max(min_value, num)
 
-    if route is not None and not is_valid_route(route):
-        return json_error(
-            "Invalid route. Use only letters, numbers, _, -, . and max 80 chars.",
-            status=400,
-            code="invalid_route"
-        )
+    if max_value is not None:
+        num = min(max_value, num)
 
-    return None
+    return num
 
 
 # ============================================================
@@ -235,28 +283,43 @@ def after_request(response):
 
 
 # ============================================================
-# ENDPOINTS
+# INFO
 # ============================================================
 
 @app.route("/", methods=["GET"])
 def info():
     uptime = round(now() - STATS["started_at"], 2)
-
     total_packets = sum(len(q) for q in TRAFFIC_BUS.values())
+
+    cleanup_nodes()
 
     return json_ok({
         "engine": ENGINE_NAME,
-        "mode": "Zero-Persistence / Pure-Transport",
+        "mode": "Zero-Persistence / Pure-Transport / P2P-Bootstrap",
         "status": "online",
         "uptime_seconds": uptime,
         "active_routes": len(TRAFFIC_BUS),
         "queued_packets": total_packets,
+        "active_nodes": len(NODES),
+        "endpoints": {
+            "push": "POST /push/<route>",
+            "pull": "GET /pull/<route>",
+            "peek": "GET /peek/<route>",
+            "flush": "DELETE /flush/<route>",
+            "register_node": "POST /register/<node_id>",
+            "peers": "GET /peers",
+            "send_to_node": "POST /send/<node_id>",
+            "broadcast": "POST /broadcast",
+            "decode": "POST /decode",
+            "stats": "GET /stats"
+        },
         "limits": {
             "max_packets_per_route": MAX_PACKETS_PER_ROUTE,
             "max_payload_bytes": MAX_PAYLOAD_BYTES,
             "packet_ttl_seconds": PACKET_TTL_SECONDS,
             "max_pull_packets": MAX_PULL_PACKETS,
             "compression_level": COMPRESSION_LEVEL,
+            "node_ttl_seconds": NODE_TTL_SECONDS,
             "rate_limit_window": RATE_LIMIT_WINDOW,
             "rate_limit_requests": RATE_LIMIT_REQUESTS
         },
@@ -279,6 +342,7 @@ def stats():
         return auth_error
 
     cleanup_all_routes()
+    cleanup_nodes()
 
     with GLOBAL_LOCK:
         stats_copy = dict(STATS)
@@ -292,11 +356,19 @@ def stats():
             "newest_age_seconds": round(now() - q[-1]["t"], 2) if q else None
         }
 
+    with NODES_LOCK:
+        nodes_copy = dict(NODES)
+
     return json_ok({
         "stats": stats_copy,
-        "routes": route_data
+        "routes": route_data,
+        "nodes": nodes_copy
     })
 
+
+# ============================================================
+# RELAY BÁSICO
+# ============================================================
 
 @app.route("/push/<route>", methods=["POST"])
 def push(route):
@@ -316,11 +388,7 @@ def push(route):
     raw_payload = request.get_data(cache=False)
 
     if not raw_payload:
-        return json_error(
-            "Empty payload",
-            status=400,
-            code="empty_payload"
-        )
+        return json_error("Empty payload", status=400, code="empty_payload")
 
     if len(raw_payload) > MAX_PAYLOAD_BYTES:
         return json_error(
@@ -330,37 +398,16 @@ def push(route):
         )
 
     try:
-        timestamp = now()
-
-        compressed = zlib.compress(raw_payload, COMPRESSION_LEVEL)
-        encoded = base64.b64encode(compressed).decode("ascii")
-
-        pkt = {
-            "id": packet_id(route, raw_payload, timestamp),
-            "d": encoded,
-            "t": timestamp,
-            "raw": len(raw_payload),
-            "zip": len(compressed)
-        }
-
-        lock = ROUTE_LOCKS[route]
-
-        with lock:
-            cleanup_route(route)
-            TRAFFIC_BUS[route].append(pkt)
-
-        with GLOBAL_LOCK:
-            STATS["push_total"] += 1
-            STATS["bytes_in_total"] += len(raw_payload)
+        pkt, queue_size = push_packet_to_route(route, raw_payload)
 
         return json_ok({
             "accepted": True,
             "packet_id": pkt["id"],
             "route": route,
             "raw_bytes": len(raw_payload),
-            "compressed_bytes": len(compressed),
-            "queue_size": len(TRAFFIC_BUS[route])
-        }, status=200)
+            "compressed_bytes": pkt["zip"],
+            "queue_size": queue_size
+        })
 
     except Exception as e:
         with GLOBAL_LOCK:
@@ -429,10 +476,6 @@ def pull(route):
 
 @app.route("/peek/<route>", methods=["GET"])
 def peek(route):
-    """
-    Mira paquetes sin borrarlos.
-    Útil para debug.
-    """
     auth_error = require_auth_and_limits(route)
     if auth_error:
         return auth_error
@@ -495,15 +538,180 @@ def flush_all():
     })
 
 
+# ============================================================
+# P2P BOOTSTRAP
+# ============================================================
+
+@app.route("/register/<node_id>", methods=["POST"])
+def register_node(node_id):
+    auth_error = require_auth_and_limits(node_id)
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True) or {}
+
+    public_ip = get_client_ip()
+    p2p_port = safe_int(data.get("p2p_port", 7777), 7777, 1, 65535)
+    name = str(data.get("name", node_id))[:80]
+
+    # opcional: IP local que manda el cliente
+    local_ip = str(data.get("local_ip", ""))[:80]
+    version = str(data.get("version", "unknown"))[:80]
+
+    node_data = {
+        "id": node_id,
+        "name": name,
+        "public_ip": public_ip,
+        "local_ip": local_ip,
+        "p2p_port": p2p_port,
+        "last_seen": now(),
+        "relay_route": f"node.{node_id}",
+        "version": version
+    }
+
+    with NODES_LOCK:
+        is_new = node_id not in NODES
+        NODES[node_id] = node_data
+
+    with GLOBAL_LOCK:
+        if is_new:
+            STATS["registered_nodes_total"] += 1
+
+    return json_ok({
+        "registered": True,
+        "node": node_data
+    })
+
+
+@app.route("/peers", methods=["GET"])
+def get_peers():
+    auth_error = require_auth_and_limits()
+    if auth_error:
+        return auth_error
+
+    cleanup_nodes()
+
+    exclude = request.args.get("exclude", "").strip()
+
+    with NODES_LOCK:
+        peers = [
+            node for node in NODES.values()
+            if node["id"] != exclude
+        ]
+
+    return json_ok({
+        "count": len(peers),
+        "peers": peers
+    })
+
+
+@app.route("/send/<target_node>", methods=["POST"])
+def send_to_node(target_node):
+    auth_error = require_auth_and_limits(target_node)
+    if auth_error:
+        return auth_error
+
+    raw_payload = request.get_data(cache=False)
+
+    if not raw_payload:
+        return json_error("Empty payload", 400, "empty_payload")
+
+    if len(raw_payload) > MAX_PAYLOAD_BYTES:
+        return json_error(
+            f"Payload too large. Max allowed: {MAX_PAYLOAD_BYTES} bytes.",
+            status=413,
+            code="payload_too_large"
+        )
+
+    route = f"node.{target_node}"
+
+    try:
+        pkt, queue_size = push_packet_to_route(route, raw_payload)
+
+        with GLOBAL_LOCK:
+            STATS["relay_send_total"] += 1
+
+        return json_ok({
+            "sent": True,
+            "target": target_node,
+            "route": route,
+            "packet_id": pkt["id"],
+            "queue_size": queue_size
+        })
+
+    except Exception as e:
+        with GLOBAL_LOCK:
+            STATS["errors_total"] += 1
+
+        return json_error(
+            f"Send error: {str(e)}",
+            status=500,
+            code="send_error"
+        )
+
+
+@app.route("/broadcast", methods=["POST"])
+def broadcast_to_nodes():
+    auth_error = require_auth_and_limits()
+    if auth_error:
+        return auth_error
+
+    cleanup_nodes()
+
+    raw_payload = request.get_data(cache=False)
+
+    if not raw_payload:
+        return json_error("Empty payload", 400, "empty_payload")
+
+    if len(raw_payload) > MAX_PAYLOAD_BYTES:
+        return json_error(
+            f"Payload too large. Max allowed: {MAX_PAYLOAD_BYTES} bytes.",
+            status=413,
+            code="payload_too_large"
+        )
+
+    exclude = request.args.get("exclude", "").strip()
+
+    with NODES_LOCK:
+        targets = [
+            node_id for node_id in NODES.keys()
+            if node_id != exclude
+        ]
+
+    sent = []
+
+    try:
+        for node_id in targets:
+            route = f"node.{node_id}"
+            push_packet_to_route(route, raw_payload)
+            sent.append(node_id)
+
+        with GLOBAL_LOCK:
+            STATS["broadcast_total"] += 1
+
+        return json_ok({
+            "broadcast": True,
+            "sent_to": sent,
+            "count": len(sent)
+        })
+
+    except Exception as e:
+        with GLOBAL_LOCK:
+            STATS["errors_total"] += 1
+
+        return json_error(
+            f"Broadcast error: {str(e)}",
+            status=500,
+            code="broadcast_error"
+        )
+
+
+# ============================================================
+# DECODE
+# ============================================================
+
 @app.route("/decode", methods=["POST"])
 def decode_packet():
-    """
-    Herramienta opcional para probar paquetes comprimidos.
-    Recibe JSON:
-    {
-      "d": "base64..."
-    }
-    """
     auth_error = require_auth_and_limits()
     if auth_error:
         return auth_error
@@ -511,11 +719,7 @@ def decode_packet():
     data = request.get_json(silent=True)
 
     if not data or "d" not in data:
-        return json_error(
-            "Missing field: d",
-            status=400,
-            code="missing_data"
-        )
+        return json_error("Missing field: d", status=400, code="missing_data")
 
     try:
         compressed = base64.b64decode(data["d"])
@@ -544,8 +748,8 @@ def cleaner_loop():
         try:
             time.sleep(CLEANER_INTERVAL)
             cleanup_all_routes()
+            cleanup_nodes()
 
-            # Limpiar buckets viejos de rate limit
             current = now()
 
             for ip in list(RATE_BUCKETS.keys()):
@@ -573,20 +777,12 @@ def start_cleaner():
 
 @app.errorhandler(404)
 def not_found(_):
-    return json_error(
-        "Endpoint not found",
-        status=404,
-        code="not_found"
-    )
+    return json_error("Endpoint not found", status=404, code="not_found")
 
 
 @app.errorhandler(405)
 def method_not_allowed(_):
-    return json_error(
-        "Method not allowed",
-        status=405,
-        code="method_not_allowed"
-    )
+    return json_error("Method not allowed", status=405, code="method_not_allowed")
 
 
 @app.errorhandler(413)
@@ -623,7 +819,8 @@ if __name__ == "__main__":
     print(f"[BOOT] {ENGINE_NAME}")
     print(f"[BOOT] Port: {PORT}")
     print(f"[BOOT] Max payload: {MAX_PAYLOAD_BYTES} bytes")
-    print(f"[BOOT] TTL: {PACKET_TTL_SECONDS}s")
+    print(f"[BOOT] Packet TTL: {PACKET_TTL_SECONDS}s")
+    print(f"[BOOT] Node TTL: {NODE_TTL_SECONDS}s")
 
     app.run(
         host="0.0.0.0",
